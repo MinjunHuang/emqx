@@ -30,17 +30,18 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
--record(state, {client_pid,
-                options,
-                reconnect_interval,
-                mountpoint,
-                readq,
-                writeq,
-                replayq,
-                ackref,
-                queue_option,
-                forwards = [],
-                subscriptions = []}).
+-record(state, {client_pid         :: pid(),
+                options            :: list(),
+                reconnect_interval :: pos_integer(),
+                mountpoint         :: binary(),
+                readq              :: list(),
+                writeq             :: list(),
+                replayq            :: map(),
+                ackref             :: replayq:ack_ref(),
+                queue_option       :: map(),
+                forwards           :: list(),
+                subscriptions      :: list(),
+                last_packet_id     :: emqx_mqtt_types:packet_id()}).
 
 -record(mqtt_msg, {qos = ?QOS_0, retain = false, dup = false,
                    packet_id, topic, props, payload}).
@@ -265,6 +266,17 @@ handle_info(replay, State = #state{client_pid = ClientPid, readq = ReadQ}) ->
 %% received local node message
 %%----------------------------------------------------------------
 handle_info({dispatch, _, #message{topic = Topic, payload = Payload, flags = #{retain := Retain}}},
+            State = #state{client_pid = undefined,
+                           mountpoint = Mountpoint,
+                           last_packet_id = LastPacketId
+                          }) ->
+    Msg = #mqtt_msg{qos = 0,
+                    retain = Retain,
+                    topic = mountpoint(Mountpoint, Topic),
+                    payload = Payload},
+    PktId = next_packet_id(LastPacketId),
+    {noreply, en_writeq({PktId, Msg}, State#state{ last_packet_id = PktId})};
+handle_info({dispatch, _, #message{topic = Topic, payload = Payload, flags = #{retain := Retain}}},
             State = #state{client_pid = Pid, mountpoint = Mountpoint}) ->
     Msg = #mqtt_msg{qos     = 1,
                     retain  = Retain,
@@ -272,10 +284,10 @@ handle_info({dispatch, _, #message{topic = Topic, payload = Payload, flags = #{r
                     payload = Payload},
     case emqx_client:publish(Pid, Msg) of
         {ok, PktId} ->
-            {noreply, en_writeq({PktId, Msg}, State)};
+            {noreply, en_writeq({PktId, Msg}, State#state{ last_packet_id = PktId })};
         {error, {PktId, Reason}} ->
             emqx_logger:error("[Bridge] Publish fail:~p", [Reason]),
-            {noreply, en_writeq({PktId, Msg}, State)}
+            {noreply, en_writeq({PktId, Msg}, State#state{ last_packet_id = PktId })}
     end;
 
 %%----------------------------------------------------------------
@@ -401,3 +413,8 @@ delete(_PktId, State = #state{readq = [], replayq = ReplayQ, ackref = AckRef}) -
 
 delete(PktId, State = #state{readq = ReadQ}) ->
     State#state{readq = lists:keydelete(PktId, 1, ReadQ)}.
+
+next_packet_id(16#ffff) ->
+    1;
+next_packet_id(PktId) ->
+    PktId + 1.
